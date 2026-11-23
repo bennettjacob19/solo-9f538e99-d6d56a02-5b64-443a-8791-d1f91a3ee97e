@@ -68,12 +68,25 @@
                  padding:4px 10px; font-size:12px; }
   .inline { display:flex; gap:10px; align-items:end; flex-wrap:wrap; }
   .inline > div { flex:1; min-width:140px; }
+  .base-stats { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+  .base-stats span { background:var(--panel2); border:1px solid var(--line); border-radius:8px;
+                     padding:4px 10px; font-size:12px; }
+  .base-stats b { color:var(--accent); }
+  .entries { display:grid; gap:6px; margin-top:10px; }
+  .entry { display:grid; grid-template-columns:repeat(auto-fit,minmax(90px,1fr)); gap:6px;
+           background:var(--panel2); border:1px solid var(--line); border-radius:8px;
+           padding:6px 10px; font-size:11.5px; color:var(--muted); }
+  .entry .st-ready { color:var(--green); }
+  .entry .st-computing { color:var(--amber); }
+  .pill.base_wait { background:#3b2a4f; color:var(--purple); }
+  .src { font-size:11px; color:var(--muted); }
 </style>
 </head>
 <body>
 <header>
   <h1>LoRA 推理调度台</h1>
-  <span class="sub">Flask + 纯 NumPy 线性模型 · 适配器内存上限调度（加载中按完整大小计入）</span>
+  <span class="sub">Flask + 纯 NumPy 线性模型 · 适配器内存上限调度（加载中按完整大小计入）·
+    补零后 float64 向量字节一致时复用基座乘法</span>
 </header>
 
 <main>
@@ -94,7 +107,7 @@
       </div>
     </div>
     <div class="panel">
-      <h2>慢加载 / 慢推理模拟</h2>
+      <h2>慢加载 / 慢推理 / 慢基座模拟</h2>
       <div class="inline">
         <div>
           <label>加载耗时（秒/个）</label>
@@ -104,10 +117,24 @@
           <label>推理耗时（秒/笔）</label>
           <input id="inferDelay" type="number" min="0" step="0.5">
         </div>
+        <div>
+          <label>基座乘法耗时（秒/次）</label>
+          <input id="baseDelay" type="number" min="0" step="0.5">
+        </div>
         <button class="btn" id="applyDelay">应用</button>
       </div>
-      <p class="hint">设为 0 可关闭模拟延迟；加载失败由下方适配器卡片上的开关控制，仅作用于下一次加载。</p>
+      <p class="hint">设为 0 可关闭模拟延迟；加载失败由下方适配器卡片上的开关控制，仅作用于下一次加载。
+        基座失败开关仅作用于某一个输入的下一次基座乘法。</p>
     </div>
+  </section>
+
+  <!-- 基座乘法缓存 -->
+  <section class="panel">
+    <h2>基座乘法复用（W0·x 按向量字节缓存，最多 8 项）</h2>
+    <div class="base-stats" id="baseStats"></div>
+    <div class="entries" id="baseEntries"></div>
+    <p class="hint">命中已算完的项直接复用；命中计算中的项共用本次计算（等待时不占推理线程）；
+      只有已算完且无人等待/使用的项可淘汰；满额且无法淘汰时新向量绕过缓存照常推理。</p>
   </section>
 
   <!-- 适配器卡片 -->
@@ -129,7 +156,12 @@
         <input id="vector" placeholder="例如：1, 0.5, -2, 3.1">
       </div>
       <button class="btn" id="submitBtn">提交请求</button>
-      <button class="btn ghost" id="burstBtn">并发提交 5 笔</button>
+      <button class="btn ghost" id="burstBtn">并发 5 笔（同输入）</button>
+      <button class="btn ghost" id="multiBtn">同输入跑全部适配器</button>
+    </div>
+    <div class="inline" style="margin-top:10px">
+      <button class="btn ghost" id="failBaseBtn">让该输入的下一次基座乘法失败</button>
+      <span class="hint" id="baseFailHint"></span>
     </div>
     <p class="hint" id="submitHint"></p>
   </section>
@@ -147,9 +179,9 @@
       <table>
         <thead>
           <tr><th>#</th><th>适配器</th><th>状态</th><th>说明</th>
-              <th>结果前 8 维 / L2 范数</th><th>等待/推理耗时</th><th>事件时间线</th></tr>
+              <th>基座来源</th><th>结果前 8 维 / L2 范数</th><th>等待/推理耗时</th><th>事件时间线</th></tr>
         </thead>
-        <tbody id="reqBody"><tr><td colspan="7" class="hint">暂无请求</td></tr></tbody>
+        <tbody id="reqBody"><tr><td colspan="8" class="hint">暂无请求</td></tr></tbody>
       </table>
     </div>
   </section>
@@ -157,10 +189,13 @@
 
 <script>
 const STATUS_CN = {
-  pending:"排队中", loading:"加载等待中", running:"推理中",
+  pending:"排队中", loading:"加载等待中", base_wait:"等共享基座", running:"推理中",
   success:"成功", failed:"失败", rejected:"已拒绝",
 };
 const STATE_CN = {unloaded:"未加载", loading:"加载中", resident:"已驻留", failed:"加载失败"};
+const BASE_CN = {
+  computed:"本次计算", cache:"命中缓存", joined:"共用计算中", bypass:"绕过缓存",
+};
 function fmtBytes(n) {
   if (n === undefined) return "—";
   const units = ["B","KiB","MiB","GiB"]; let v = n, i = 0;
@@ -191,6 +226,34 @@ async function render() {
   document.getElementById("workertext").textContent = s.config.max_workers;
   document.getElementById("loadDelay").placeholder = s.config.load_delay + " 秒";
   document.getElementById("inferDelay").placeholder = s.config.infer_delay + " 秒";
+  document.getElementById("baseDelay").placeholder = s.config.base_delay + " 秒";
+
+  // 基座乘法与缓存
+  const b = s.base;
+  document.getElementById("baseStats").innerHTML = [
+    `实际基座乘法 <b>${b.multiplies}</b> 次`,
+    `缓存 <b>${b.size}/${b.capacity}</b>`,
+    `命中 <b>${b.hits}</b>`,
+    `共用计算中 <b>${b.joins}</b>`,
+    `未命中计算 <b>${b.misses}</b>`,
+    `绕过 <b>${b.bypasses}</b>`,
+    `淘汰 <b>${b.evictions}</b>`,
+    `失败 <b>${b.failures}</b>`,
+    `等待共享 <b>${b.waiting}</b>`,
+  ].map(t => `<span>${t}</span>`).join("");
+
+  const entries = document.getElementById("baseEntries");
+  entries.innerHTML = b.entries.length ? b.entries.map(e => {
+    const st = e.state === "ready" ? "已算完" : "计算中";
+    return `<div class="entry">
+      <span>键 <code>${e.key}</code></span>
+      <span class="st-${e.state}">${st}</span>
+      <span>发起 #${e.owner_id !== null ? e.owner_id : "—"}</span>
+      <span>等待 ${e.waiters}</span>
+      <span>使用 ${e.users}</span>
+      <span>${e.last_used_at ? new Date(e.last_used_at*1000).toLocaleTimeString() : "—"}</span>
+    </div>`;
+  }).join("") : `<span class="hint">缓存为空</span>`;
 
   // 适配器卡片 + 下拉框
   const wrap = document.getElementById("adapters");
@@ -233,13 +296,16 @@ async function render() {
   // 请求表
   const body = document.getElementById("reqBody");
   if (!s.requests.length) {
-    body.innerHTML = `<tr><td colspan="7" class="hint">暂无请求</td></tr>`;
+    body.innerHTML = `<tr><td colspan="8" class="hint">暂无请求</td></tr>`;
   } else {
     body.innerHTML = s.requests.map(r => {
       const result = r.result
         ? `<code>[${r.result.join(", ")}]</code><br><span class="hint">L2 范数 ${r.result_norm !== null ? r.result_norm.toFixed(4) : "—"}</span>`
         : (r.error ? `<span class="err">${r.error}</span>` : "—");
       const timing = `等待 ${r.wait_ms !== null ? r.wait_ms + " ms" : "—"}<br>推理 ${r.infer_ms !== null ? r.infer_ms + " ms" : "—"}`;
+      const baseSrc = r.base_source
+        ? `<span class="src">${BASE_CN[r.base_source] || r.base_source}${r.base_cached ? " · 写/读缓存" : ""}</span>`
+        : "—";
       const events = `<ul class="timeline">${r.events.map(e =>
         `<li>${new Date(e.at*1000).toLocaleTimeString()} · ${e.message}</li>`).join("")}</ul>`;
       return `<tr>
@@ -247,6 +313,7 @@ async function render() {
         <td>${r.adapter_id}</td>
         <td><span class="pill ${r.status}">${STATUS_CN[r.status] || r.status}</span></td>
         <td>${r.detail}</td>
+        <td>${baseSrc}</td>
         <td>${result}</td>
         <td>${timing}</td>
         <td>${events}</td>
@@ -273,15 +340,36 @@ document.getElementById("burstBtn").onclick = async () => {
   const vector = document.getElementById("vector").value;
   await Promise.all(Array.from({length: 5}, () =>
     post("/api/requests", {adapter_id, vector}).catch(() => {})));
-  document.getElementById("submitHint").textContent = "已并发提交 5 笔请求（同一适配器应只加载一次）";
+  document.getElementById("submitHint").textContent = "已并发提交 5 笔同输入请求（应只计算一次基座乘法）";
   render();
+};
+document.getElementById("multiBtn").onclick = async () => {
+  const vector = document.getElementById("vector").value;
+  const ids = [...document.getElementById("selAdapter").options].map(o => o.value);
+  await Promise.all(ids.map(adapter_id =>
+    post("/api/requests", {adapter_id, vector}).catch(() => {})));
+  document.getElementById("submitHint").textContent =
+    `已用同一输入并发提交 ${ids.length} 个适配器请求（补零后字节一致，应只算一次基座）`;
+  render();
+};
+document.getElementById("failBaseBtn").onclick = async () => {
+  const vector = document.getElementById("vector").value;
+  try {
+    const r = await post("/api/simulate/fail-next-base", {vector, value: true});
+    document.getElementById("baseFailHint").textContent =
+      r.will_fail_next ? "已标记：该输入下一次基座乘法将失败（等它的请求都会报错）" : "已取消标记";
+  } catch (e) {
+    document.getElementById("baseFailHint").innerHTML = `<span class="err">${e.message}</span>`;
+  }
 };
 document.getElementById("applyDelay").onclick = async () => {
   const body = {};
   const ld = document.getElementById("loadDelay").value;
   const idv = document.getElementById("inferDelay").value;
+  const bd = document.getElementById("baseDelay").value;
   if (ld !== "") body.load_delay = Number(ld);
   if (idv !== "") body.infer_delay = Number(idv);
+  if (bd !== "") body.base_delay = Number(bd);
   await post("/api/config", body);
   render();
 };

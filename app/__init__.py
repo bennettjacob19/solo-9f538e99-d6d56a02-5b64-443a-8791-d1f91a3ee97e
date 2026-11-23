@@ -32,6 +32,13 @@ def create_app(config: dict | None = None) -> Flask:
     max_workers = parse_int(
         config.get("LORA_MAX_WORKERS", os.environ.get("LORA_MAX_WORKERS", "64"))
     )
+    base_cache_capacity = parse_int(
+        config.get("LORA_BASE_CACHE_CAPACITY",
+                   os.environ.get("LORA_BASE_CACHE_CAPACITY", "8"))
+    )
+    base_delay = parse_float(
+        config.get("LORA_BASE_DELAY", os.environ.get("LORA_BASE_DELAY", "0"))
+    )
 
     model = LinearLoRAModel(dim_in=dim_in, dim_out=dim_out)
     adapter_metas = []
@@ -48,6 +55,8 @@ def create_app(config: dict | None = None) -> Flask:
         infer_delay=infer_delay,
         fail_next=fail_next,
         max_workers=max_workers,
+        base_cache_capacity=base_cache_capacity,
+        base_delay=base_delay,
     )
 
     app = Flask(__name__)

@@ -16,4 +16,8 @@ services:
       LORA_DIM_IN: "1024"
       LORA_DIM_OUT: "1024"
       LORA_MAX_WORKERS: "64"
+      # 基座乘法结果缓存：补零后 float64 向量字节一致时复用 W0·x（硬上限 8 项）
+      LORA_BASE_CACHE_CAPACITY: "8"
+      # 基座乘法的模拟耗时（秒），网页运行时也可调整；0 表示不做延迟
+      LORA_BASE_DELAY: "0"
     restart: unless-stopped

@@ -125,3 +125,99 @@ def test_clear_history():
     client.delete("/api/requests")
     state = client.get("/api/state").get_json()
     assert state["requests"] == []
+
+
+def test_same_vector_reuses_base_over_http():
+    app = _app(None)
+    client = app.test_client()
+    vector = [1, 2, 3, 4]
+
+    ids = []
+    for adapter_id in ("lora-small", "lora-medium", "lora-large"):
+        ids.append(client.post("/api/requests", json={
+            "adapter_id": adapter_id, "vector": vector,
+        }).get_json()["id"])
+    records = [_wait(client, rid) for rid in ids]
+
+    assert all(r["status"] == SUCCESS for r in records)
+    assert all(len(r["result"]) == 8 and r["result_norm"] is not None
+               for r in records)
+    state = client.get("/api/state").get_json()
+    assert state["base"]["multiplies"] == 1
+    assert state["base"]["size"] == 1
+    assert {r["base_source"] for r in records} <= {"computed", "cache", "joined"}
+
+    base = client.get("/api/base").get_json()
+    assert base["multiplies"] == 1 and base["capacity"] == 8
+
+
+def test_padded_vector_cache_key_matches():
+    app = _app(None)
+    client = app.test_client()
+
+    rid1 = client.post("/api/requests", json={
+        "adapter_id": "lora-small", "vector": [1, 2],
+    }).get_json()["id"]
+    _wait(client, rid1)
+    # 显式补零到模型维度，字节一致
+    rid2 = client.post("/api/requests", json={
+        "adapter_id": "lora-medium", "vector": [1, 2] + [0] * 14,
+    }).get_json()["id"]
+    rec2 = _wait(client, rid2)
+
+    assert rec2["status"] == SUCCESS
+    assert rec2["base_source"] == "cache"
+    state = client.get("/api/state").get_json()
+    assert state["base"]["multiplies"] == 1
+
+
+def test_base_failure_endpoint_and_retry():
+    app = _app(None)
+    client = app.test_client()
+    vector = [1, 2, 3]
+
+    resp = client.post("/api/simulate/fail-next-base",
+                       json={"vector": vector, "value": True})
+    assert resp.get_json()["will_fail_next"] is True
+
+    rid = client.post("/api/requests", json={
+        "adapter_id": "lora-small", "vector": vector,
+    }).get_json()["id"]
+    rec = _wait(client, rid)
+    assert rec["status"] == FAILED and "基座乘法" in rec["error"]
+
+    state = client.get("/api/state").get_json()
+    assert state["base"]["multiplies"] == 0
+    assert state["base"]["size"] == 0
+    assert state["base"]["failures"] == 1
+
+    # 下一笔同输入可重算
+    rid2 = client.post("/api/requests", json={
+        "adapter_id": "lora-small", "vector": vector,
+    }).get_json()["id"]
+    rec2 = _wait(client, rid2)
+    assert rec2["status"] == SUCCESS
+    state = client.get("/api/state").get_json()
+    assert state["base"]["multiplies"] == 1 and state["base"]["size"] == 1
+
+
+def test_base_failure_endpoint_accepts_csv_string():
+    app = _app(None)
+    client = app.test_client()
+    resp = client.post("/api/simulate/fail-next-base",
+                       json={"vector": "1, 2, 3", "value": True})
+    assert resp.status_code == 200 and resp.get_json()["will_fail_next"] is True
+
+    bad = client.post("/api/simulate/fail-next-base",
+                      json={"vector": [1.0] * 999})
+    assert bad.status_code == 400
+
+
+def test_base_delay_config_update():
+    app = _app(None)
+    client = app.test_client()
+    cfg = client.post("/api/config", json={"base_delay": 0.5}).get_json()
+    assert cfg["base_delay"] == 0.5
+
+    bad = client.post("/api/config", json={"base_delay": "abc"})
+    assert bad.status_code == 400

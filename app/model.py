@@ -59,11 +59,20 @@ class LinearLoRAModel:
         b = rng_b.normal(0.0, 0.05, size=(self.dim_out, rank)).astype(_DTYPE)
         return {"A": a, "B": b}
 
+    def base_forward(self, x: np.ndarray) -> np.ndarray:
+        """基座乘法 ``W0 @ x``，与适配器无关，可按输入字节缓存复用。"""
+        return self.W0 @ x
+
+    def adapter_delta(
+        self, x: np.ndarray, adapter: dict, rank: int, alpha: float
+    ) -> np.ndarray:
+        """适配器增量 ``(alpha/r)·B·(A·x)``。"""
+        scaling = alpha / rank
+        return scaling * (adapter["B"] @ (adapter["A"] @ x))
+
     def forward(self, x: np.ndarray, adapter: dict | None, rank: int, alpha: float) -> np.ndarray:
         """线性前向；adapter 为 None 时只走基座。"""
-        base = self.W0 @ x
+        base = self.base_forward(x)
         if adapter is None:
             return base
-        scaling = alpha / rank
-        delta = scaling * (adapter["B"] @ (adapter["A"] @ x))
-        return base + delta
+        return base + self.adapter_delta(x, adapter, rank, alpha)

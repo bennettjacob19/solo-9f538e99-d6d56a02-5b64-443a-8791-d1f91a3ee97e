@@ -18,7 +18,8 @@ _LIVE_SCHEDULERS: list = []
 
 
 def make_scheduler(memory_limit, *, load_delay=0.0, infer_delay=0.0,
-                   fail_next=None, no_sleep=True):
+                   fail_next=None, no_sleep=True, max_workers=32,
+                   base_cache_capacity=8, **kwargs):
     model = LinearLoRAModel(dim_in=DIM_IN, dim_out=DIM_OUT)
     metas = []
     for adapter_id, rank in RANKS.items():
@@ -29,7 +30,8 @@ def make_scheduler(memory_limit, *, load_delay=0.0, infer_delay=0.0,
     scheduler = LoRAScheduler(
         model=model, adapter_metas=metas, memory_limit=memory_limit,
         load_delay=load_delay, infer_delay=infer_delay,
-        fail_next=fail_next, max_workers=32,
+        fail_next=fail_next, max_workers=max_workers,
+        base_cache_capacity=base_cache_capacity, **kwargs,
     )
     if no_sleep:
         scheduler._simulate_work = lambda *a, **k: None
@@ -56,7 +58,7 @@ def x_vec(n=DIM_IN):
 
 
 def wait_state(scheduler, rid, states, timeout=10.0):
-    """轮询等待某请求进入指定状态集合。"""
+    """轮询等待某请求进入指定状态集合；超时则输出调度器快照便于定位。"""
     import time
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -65,7 +67,23 @@ def wait_state(scheduler, rid, states, timeout=10.0):
             if record.status in states:
                 return record
         time.sleep(0.01)
-    raise AssertionError(f"请求 {rid} 未在 {timeout}s 内进入 {states}")
+    with scheduler._lock:
+        dump = {
+            "requests": [
+                (r.id, r.adapter_id, r.status, r.detail, r.base_source,
+                 r.claimed, r.gen, list(r.events))
+                for r in scheduler._requests
+            ],
+            "adapters": [
+                (a.id, a.state, a.in_use, a.gen, a.load_attempts)
+                for a in scheduler.adapters.values()
+            ],
+            "committed": scheduler.committed,
+            "base": scheduler.base_cache.stats(),
+        }
+    raise AssertionError(
+        f"请求 {rid} 未在 {timeout}s 内进入 {states}；快照：{dump}"
+    )
 
 
 def wait_done(scheduler, rid, timeout=10.0):
