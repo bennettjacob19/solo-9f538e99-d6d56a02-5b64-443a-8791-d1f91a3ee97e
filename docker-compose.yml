@@ -1,0 +1,19 @@
+services:
+  lora-web:
+    build: .
+    image: lora-inference-web:latest
+    container_name: lora-inference-web
+    ports:
+      - "8000:8000"
+    environment:
+      # 适配器权重的内存上限；加载中的权重也按完整大小计入
+      LORA_MEMORY_LIMIT: "4.5MiB"
+      # 模拟慢加载 / 慢推理（秒），可在网页运行时调整
+      LORA_LOAD_DELAY: "2"
+      LORA_INFER_DELAY: "1"
+      # 逗号分隔：启动时就让这些适配器的下一次加载失败（可留空）
+      LORA_FAIL_NEXT: ""
+      LORA_DIM_IN: "1024"
+      LORA_DIM_OUT: "1024"
+      LORA_MAX_WORKERS: "64"
+    restart: unless-stopped

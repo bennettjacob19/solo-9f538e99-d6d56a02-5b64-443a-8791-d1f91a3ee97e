@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LoRA 推理调度台 · Flask + NumPy</title>
+<style>
+  :root {
+    --bg: #0f1420; --panel: #181f2e; --panel2: #1f293d; --line: #2a3650;
+    --text: #e6ebf5; --muted: #8a97ad; --accent: #5b9dff; --green: #3ecf8e;
+    --amber: #f5b544; --red: #ff6b6b; --purple: #b18cff;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font:14px/1.5 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; }
+  header { padding:18px 24px; border-bottom:1px solid var(--line);
+           display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; }
+  header .sub { color:var(--muted); font-size:12px; }
+  main { padding:20px 24px; display:grid; gap:18px; max-width:1280px; margin:0 auto; }
+  .grid { display:grid; gap:14px; }
+  .grid.cols3 { grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); }
+  .grid.cols2 { grid-template-columns:repeat(auto-fit,minmax(360px,1fr)); }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; }
+  .panel h2 { margin:0 0 12px; font-size:14px; color:var(--muted); font-weight:600;
+              text-transform:uppercase; letter-spacing:.06em; }
+  .membar { height:14px; border-radius:7px; background:var(--panel2); overflow:hidden; border:1px solid var(--line); }
+  .membar > div { height:100%; background:linear-gradient(90deg,var(--accent),var(--purple));
+                  transition:width .4s ease; }
+  .mem-meta { display:flex; justify-content:space-between; margin-top:8px; color:var(--muted); font-size:12px; }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:4px 14px; font-size:13px; }
+  .kv b { color:var(--muted); font-weight:500; }
+  .adapter { background:var(--panel2); border:1px solid var(--line); border-radius:10px; padding:14px; }
+  .adapter .top { display:flex; justify-content:space-between; align-items:center; gap:8px; }
+  .adapter .name { font-weight:600; }
+  .badge { font-size:11px; padding:2px 8px; border-radius:999px; border:1px solid var(--line); color:var(--muted); }
+  .badge.resident { color:var(--green); border-color:var(--green); }
+  .badge.loading  { color:var(--amber); border-color:var(--amber); }
+  .badge.failed   { color:var(--red); border-color:var(--red); }
+  .badge.unloaded { color:var(--muted); }
+  .adapter .row { display:flex; justify-content:space-between; color:var(--muted); font-size:12px; margin-top:6px; }
+  .adapter .row b { color:var(--text); font-weight:600; }
+  .btn { background:var(--accent); color:#0b1020; border:0; border-radius:8px; padding:8px 14px;
+         font-weight:600; cursor:pointer; }
+  .btn.ghost { background:var(--panel2); color:var(--text); border:1px solid var(--line); }
+  .btn.danger { background:transparent; color:var(--red); border:1px solid var(--red); }
+  .btn:disabled { opacity:.5; cursor:not-allowed; }
+  label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; }
+  input, select { width:100%; background:var(--panel2); border:1px solid var(--line); color:var(--text);
+                  border-radius:8px; padding:8px 10px; font-size:13px; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; position:sticky; top:0; background:var(--panel); }
+  .table-wrap { max-height:460px; overflow:auto; }
+  .pill { font-size:11px; padding:2px 8px; border-radius:999px; white-space:nowrap; }
+  .pill.pending  { background:#2b3550; color:var(--muted); }
+  .pill.loading  { background:#3d3317; color:var(--amber); }
+  .pill.running  { background:#1d3450; color:var(--accent); }
+  .pill.success  { background:#15382a; color:var(--green); }
+  .pill.failed, .pill.rejected { background:#3d1d1d; color:var(--red); }
+  code { background:var(--panel2); padding:1px 6px; border-radius:6px; font-size:11.5px; }
+  .timeline { margin:6px 0 0; padding-left:18px; color:var(--muted); font-size:11.5px; }
+  .timeline li { margin-bottom:2px; }
+  .err { color:var(--red); }
+  .hint { color:var(--muted); font-size:12px; margin-top:8px; }
+  .counts { display:flex; gap:8px; flex-wrap:wrap; }
+  .counts span { background:var(--panel2); border:1px solid var(--line); border-radius:8px;
+                 padding:4px 10px; font-size:12px; }
+  .inline { display:flex; gap:10px; align-items:end; flex-wrap:wrap; }
+  .inline > div { flex:1; min-width:140px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>LoRA 推理调度台</h1>
+  <span class="sub">Flask + 纯 NumPy 线性模型 · 适配器内存上限调度（加载中按完整大小计入）</span>
+</header>
+
+<main>
+  <!-- 内存与全局配置 -->
+  <section class="grid cols2">
+    <div class="panel">
+      <h2>适配器内存占用</h2>
+      <div class="membar"><div id="memfill" style="width:0%"></div></div>
+      <div class="mem-meta">
+        <span id="memtext">—</span>
+        <span id="mempct">0%</span>
+      </div>
+      <div class="kv" style="margin-top:12px">
+        <b>基座权重（常驻不计额度）</b><span id="basesize">—</span>
+        <b>LRU 卸载次数</b><span id="evictions">0</span>
+        <b>模型维度</b><span id="dimtext">—</span>
+        <b>工作线程</b><span id="workertext">—</span>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>慢加载 / 慢推理模拟</h2>
+      <div class="inline">
+        <div>
+          <label>加载耗时（秒/个）</label>
+          <input id="loadDelay" type="number" min="0" step="0.5">
+        </div>
+        <div>
+          <label>推理耗时（秒/笔）</label>
+          <input id="inferDelay" type="number" min="0" step="0.5">
+        </div>
+        <button class="btn" id="applyDelay">应用</button>
+      </div>
+      <p class="hint">设为 0 可关闭模拟延迟；加载失败由下方适配器卡片上的开关控制，仅作用于下一次加载。</p>
+    </div>
+  </section>
+
+  <!-- 适配器卡片 -->
+  <section class="panel">
+    <h2>适配器（三种大小）</h2>
+    <div class="grid cols3" id="adapters"></div>
+  </section>
+
+  <!-- 提交请求 -->
+  <section class="panel">
+    <h2>提交推理请求</h2>
+    <div class="inline">
+      <div style="flex:0 0 200px">
+        <label>适配器</label>
+        <select id="selAdapter"></select>
+      </div>
+      <div style="flex:2">
+        <label>输入向量（逗号分隔数字，不足维度自动补 0，留空为全零）</label>
+        <input id="vector" placeholder="例如：1, 0.5, -2, 3.1">
+      </div>
+      <button class="btn" id="submitBtn">提交请求</button>
+      <button class="btn ghost" id="burstBtn">并发提交 5 笔</button>
+    </div>
+    <p class="hint" id="submitHint"></p>
+  </section>
+
+  <!-- 请求列表 -->
+  <section class="panel">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+      <h2 style="margin:0">请求状态与结果</h2>
+      <div class="inline" style="gap:8px;">
+        <div class="counts" id="counts"></div>
+        <button class="btn ghost" id="clearBtn">清理已结束记录</button>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>#</th><th>适配器</th><th>状态</th><th>说明</th>
+              <th>结果前 8 维 / L2 范数</th><th>等待/推理耗时</th><th>事件时间线</th></tr>
+        </thead>
+        <tbody id="reqBody"><tr><td colspan="7" class="hint">暂无请求</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script>
+const STATUS_CN = {
+  pending:"排队中", loading:"加载等待中", running:"推理中",
+  success:"成功", failed:"失败", rejected:"已拒绝",
+};
+const STATE_CN = {unloaded:"未加载", loading:"加载中", resident:"已驻留", failed:"加载失败"};
+function fmtBytes(n) {
+  if (n === undefined) return "—";
+  const units = ["B","KiB","MiB","GiB"]; let v = n, i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return (i === 0 ? v.toFixed(0) : v.toFixed(1)) + units[i];
+}
+async function api(path, options) {
+  const r = await fetch(path, options);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || ("HTTP " + r.status));
+  return data;
+}
+const post = (path, body) => api(path, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+
+async function render() {
+  let s;
+  try { s = await api("/api/state"); } catch (e) { return; }
+
+  // 内存
+  const pct = s.memory.limit ? Math.min(100, s.memory.committed / s.memory.limit * 100) : 0;
+  document.getElementById("memfill").style.width = pct.toFixed(1) + "%";
+  document.getElementById("memtext").textContent =
+    `已占用 ${fmtBytes(s.memory.committed)}（含加载中） / 上限 ${fmtBytes(s.memory.limit)} · 空闲 ${fmtBytes(s.memory.free)}`;
+  document.getElementById("mempct").textContent = pct.toFixed(1) + "%";
+  document.getElementById("basesize").textContent = fmtBytes(s.memory.base_model_nbytes);
+  document.getElementById("evictions").textContent = s.memory.evictions;
+  document.getElementById("dimtext").textContent = `${s.config.dim_in} → ${s.config.dim_out}`;
+  document.getElementById("workertext").textContent = s.config.max_workers;
+  document.getElementById("loadDelay").placeholder = s.config.load_delay + " 秒";
+  document.getElementById("inferDelay").placeholder = s.config.infer_delay + " 秒";
+
+  // 适配器卡片 + 下拉框
+  const wrap = document.getElementById("adapters");
+  const sel = document.getElementById("selAdapter");
+  const currentSel = sel.value;
+  wrap.innerHTML = "";
+  sel.innerHTML = "";
+  for (const a of s.adapters) {
+    sel.insertAdjacentHTML("beforeend", `<option value="${a.id}">${a.id}（rank=${a.rank}，${fmtBytes(a.nbytes)}）</option>`);
+    const card = document.createElement("div");
+    card.className = "adapter";
+    card.innerHTML = `
+      <div class="top">
+        <span class="name">${a.id}</span>
+        <span class="badge ${a.state}">${STATE_CN[a.state] || a.state}</span>
+      </div>
+      <div class="row"><span>rank / 大小</span><b>${a.rank} · ${fmtBytes(a.nbytes)}</b></div>
+      <div class="row"><span>实际加载次数</span><b>${a.load_attempts}（成功 ${a.load_successes}）</b></div>
+      <div class="row"><span>认领/在服请求</span><b>${a.in_use} · LRU时刻 ${a.last_used_at ? new Date(a.last_used_at*1000).toLocaleTimeString() : "—"}</b></div>
+      <div style="margin-top:10px">
+        <button class="btn ${a.will_fail_next ? "danger" : "ghost"}" data-adapter="${a.id}" data-fail="${a.will_fail_next ? "0" : "1"}">
+          ${a.will_fail_next ? "✓ 下次加载将失败（点击取消）" : "模拟下次加载失败"}
+        </button>
+      </div>`;
+    wrap.appendChild(card);
+  }
+  if (currentSel) sel.value = currentSel;
+  wrap.querySelectorAll("button[data-adapter]").forEach(btn => {
+    btn.onclick = async () => {
+      await post("/api/simulate/fail-next", {adapter_id: btn.dataset.adapter, value: btn.dataset.fail === "1"});
+      render();
+    };
+  });
+
+  // 计数
+  const counts = document.getElementById("counts");
+  counts.innerHTML = Object.entries(s.counts)
+    .map(([k, v]) => `<span class="pill ${k}">${STATUS_CN[k] || k}：${v}</span>`).join("");
+
+  // 请求表
+  const body = document.getElementById("reqBody");
+  if (!s.requests.length) {
+    body.innerHTML = `<tr><td colspan="7" class="hint">暂无请求</td></tr>`;
+  } else {
+    body.innerHTML = s.requests.map(r => {
+      const result = r.result
+        ? `<code>[${r.result.join(", ")}]</code><br><span class="hint">L2 范数 ${r.result_norm !== null ? r.result_norm.toFixed(4) : "—"}</span>`
+        : (r.error ? `<span class="err">${r.error}</span>` : "—");
+      const timing = `等待 ${r.wait_ms !== null ? r.wait_ms + " ms" : "—"}<br>推理 ${r.infer_ms !== null ? r.infer_ms + " ms" : "—"}`;
+      const events = `<ul class="timeline">${r.events.map(e =>
+        `<li>${new Date(e.at*1000).toLocaleTimeString()} · ${e.message}</li>`).join("")}</ul>`;
+      return `<tr>
+        <td>${r.id}${r.loaded_for ? ' <span class="pill loading">触发加载</span>' : ""}</td>
+        <td>${r.adapter_id}</td>
+        <td><span class="pill ${r.status}">${STATUS_CN[r.status] || r.status}</span></td>
+        <td>${r.detail}</td>
+        <td>${result}</td>
+        <td>${timing}</td>
+        <td>${events}</td>
+      </tr>`;
+    }).join("");
+  }
+}
+
+async function submitOne() {
+  const adapter_id = document.getElementById("selAdapter").value;
+  const vector = document.getElementById("vector").value;
+  try {
+    const r = await post("/api/requests", {adapter_id, vector});
+    document.getElementById("submitHint").textContent = `已提交请求 #${r.id}：${r.detail}`;
+  } catch (e) {
+    document.getElementById("submitHint").innerHTML = `<span class="err">${e.message}</span>`;
+  }
+  render();
+}
+
+document.getElementById("submitBtn").onclick = submitOne;
+document.getElementById("burstBtn").onclick = async () => {
+  const adapter_id = document.getElementById("selAdapter").value;
+  const vector = document.getElementById("vector").value;
+  await Promise.all(Array.from({length: 5}, () =>
+    post("/api/requests", {adapter_id, vector}).catch(() => {})));
+  document.getElementById("submitHint").textContent = "已并发提交 5 笔请求（同一适配器应只加载一次）";
+  render();
+};
+document.getElementById("applyDelay").onclick = async () => {
+  const body = {};
+  const ld = document.getElementById("loadDelay").value;
+  const idv = document.getElementById("inferDelay").value;
+  if (ld !== "") body.load_delay = Number(ld);
+  if (idv !== "") body.infer_delay = Number(idv);
+  await post("/api/config", body);
+  render();
+};
+document.getElementById("clearBtn").onclick = async () => {
+  await api("/api/requests", {method: "DELETE"});
+  render();
+};
+render();
+setInterval(render, 1000);
+</script>
+</body>
+</html>
